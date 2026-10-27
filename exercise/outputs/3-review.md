@@ -1,0 +1,42 @@
+Reviewer: Claude Code (Anthropic), model Claude Fable 5.1 (`claude-fable-5-1`). Review of `docs/adr/0002-publish-order-placed-event-to-rabbitmq.md` against `docs/scenario.md`, ATAM style.
+
+# Review of ADR-0002: Publish `OrderPlaced` to RabbitMQ
+
+## 1. Quality-attribute scenarios
+
+| # | Source | Stimulus | Environment | Response | Response measure |
+|---|---|---|---|---|---|
+| S1 Performance | Customer via `frontend` | `PlaceOrder` | 11.11 peak, 200 orders/s, 3-node RabbitMQ healthy | Payment, shipping, cart-empty, then publish with publisher confirm, then respond | p95 ≤ 500 ms; publish + confirm adds ≤ ~30 ms to today's ≈ 300 ms (ADR's own "within 10 %" target), measured at 200/s |
+| S2 Availability | Operator / fault | MailFast times out (p99 8 s), `loyaltyservice` is down, **and** the whole RabbitMQ cluster is unreachable | Same peak | Order succeeds; events queue, or (broker down) are captured for replay without slowing checkout | 100 % order success attributable to these components; p95 still ≤ 500 ms while the broker is down; 0 events lost |
+| S3 Reliability | `loyaltyservice` crash | Consumer dies after awarding points, before ack; message redelivered | Normal load, 200 events/s | Second delivery is detected by `order_id` and acked without a second award | 0 duplicate awards; p100 award time ≤ 60 s after order |
+| S4 Throughput / UX | Marketing sale | 200 orders/s sustained for the length of the 11.11 peak | MailFast capped at 50 emails/s, 0.5 % failures | `q.email` absorbs the 150/s surplus; limiter never exceeds 50/s | Backlog drains at 3 min per 1 min of peak; confirmation email delay ≤ 15 min (ADR assumption, unconfirmed) |
+
+## 2. Findings
+
+| Type | Finding | Why it matters |
+|---|---|---|
+| **Non-risk** | Durable queue per consumer, manual ack after the side effect, order never blocked on a consumer: directly satisfies the hard constraint "an order must never fail because email, loyalty or analytics is down". | Options 1 and 2 are correctly rejected on evidence (MailFast p95 1.5 s vs 500 ms budget; goroutine work lost on pod restart breaks exactly-once). |
+| **Non-risk** | RabbitMQ over Kafka: 200 msgs/s needs no log retention or partitioning; two of four developers know RabbitMQ; self-hosted matches operations. | Keeps the new moving parts to one and matches team fit, the scenario's stated constraints. |
+| **Risk** | **Broker-down path is under-designed.** "Retry within the remaining latency budget" means every `PlaceOrder` burns up to 200 ms waiting on a dead broker, so p95 drifts to ~500 ms exactly when the system is under stress (S1 and S2 collide). If the AMQP connection is opened like `mustConnGRPC` at start-up, checkout pods cannot even start while RabbitMQ is down. | Turns a post-order dependency back into a checkout dependency, which is what the ADR exists to prevent. |
+| **Risk** | **Manual replay from error logs does not scale.** At 200 orders/s, a 60-second broker outage is 12,000 events, each logged with email and shipping address at error level, to be re-published "by hand from a CLI". The 1-minute loyalty goal is missed for all of them and PII lands in the logging pipeline, contradicting the ADR's own "no logging of the event body" rule. | Reliability and privacy both degrade on the one path the ADR admits is unprotected. |
+| **Risk** | **Prefetch cannot enforce 50 emails/s.** With prefetch P and MailFast latency L, rate ≈ P/L; L swings from 1.5 s (p95) to 8 s (p99), so the same prefetch yields 5x different rates. Meanwhile 50/s at 8 s tail needs up to ~400 in-flight calls, which the ADR does not size. | The mitigation in the risk list is likely wrong; MailFast will reject bursts and the 0.5 % failure rate will rise. |
+| **Risk** | **Exactly-once loyalty is asserted, not designed.** The dedup set and the balance update live in an unspecified store (open question 3); unless both are written in one transaction, a crash between them double-awards. A message TTL "so processed messages do not linger" applied to `q.loyalty` would dead-letter unprocessed loyalty events during a consumer outage, i.e. points never awarded. | The scenario's "exactly once" is a hard requirement; the ADR's own privacy mitigation can defeat it. |
+| **Sensitivity point** | Publisher-confirm latency on quorum queues across 3 nodes at 200 publishes/s, and the publish deadline chosen. | S1 passes or fails on this single number, which the ADR never estimates. |
+| **Sensitivity point** | **Peak duration.** Email delay = 3 x peak minutes. A 5-minute peak fits the 15-minute assumption; an 11.11 sale that runs hours at > 50 orders/s produces hours of delay that no queue sizing can fix. | Driver 4 ("throughput smoothing") is only solvable by buffering if the peak is short; otherwise it is an email-capacity problem, not a messaging problem. |
+| **Trade-off point** | Publisher confirms + persistent messages (reliability) vs. request latency (performance): confirms are the only reason the publish is on the critical path at all. | Must be measured, not assumed, under S1. |
+| **Trade-off point** | Carrying email and shipping address in the event (consumer autonomy, no order store) vs. privacy footprint; TTL as privacy control vs. loyalty reliability. | The same knob (TTL) moves privacy and reliability in opposite directions. |
+| **Trade-off point** | 3-node quorum-queue cluster (availability of post-order actions) vs. cost, confirm latency and operational load on a 4-person team. | A single-node broker with a local fallback spool may give equal order availability for far less. |
+
+## 3. Missing or weak
+
+- **Options not considered.** (a) **Redis Streams** on the Redis the ADR already cites from ADR-0001: consumer groups, acks and pending lists, zero new stateful components, satisfies "as few new moving parts as possible"; it deserved a row even if rejected on durability. (b) A **local durable spool / lightweight outbox** in `checkoutservice` (file or Redis) with a sidecar re-publisher, instead of dismissing the outbox because "there is no order store". (c) For email specifically: a higher MailFast tier, a second provider, or explicit prioritisation; the ADR buffers the 200-vs-50 mismatch but never asks whether 50/s is negotiable.
+- **Consequences not stated.** `q.email` needs a max-length / overflow policy for a long sale (unbounded disk growth otherwise); the replay CLI is new tooling that must be built, tested and secured because it handles PII; checkout's start-up and health-check behaviour when RabbitMQ is absent; the operational cost of a 3-node broker before a single consumer exists.
+- **Inconsistencies / unsupported claims.** Decision binds queues to `order.placed` while the risk list versions it as `order.placed.v1`: pick the versioned key now, re-binding later is the change the ADR promises to avoid. "Well inside the 200 ms budget" and "expected to be rare" carry no numbers or availability target. The claim that prefetch bounds throughput is incorrect (see Risk). TTL and dead-letter behaviour on quorum queues differ from classic queues (dead-lettering is at-most-once unless configured): verify before relying on them.
+
+## 4. Verdict
+
+**Accept with changes.** The core decision (asynchronous event, one durable queue per consumer, RabbitMQ over Kafka) is the right call for this scenario and is well evidenced. Three changes are required before approval:
+
+1. **Specify the broker-down design.** Lazy AMQP connection (never `must` at start-up), a publish deadline of tens of milliseconds with a circuit breaker so p95 stays near 300 ms when the broker is unreachable, and an **automatic local fallback** (durable spool or Redis outbox re-published by a background worker) in place of PII-bearing error logs and manual replay.
+2. **Fix the email path.** Enforce 50/s with a token bucket in a single `emailservice` replica (or a shared limiter in the existing Redis), size concurrency for 50/s x 8 s tail, set a max queue length with an explicit overflow policy, and get the product owner's peak-duration answer **before** this ADR is approved; if the peak exceeds about 5 minutes, add an email-capacity decision (higher tier or second provider).
+3. **Make loyalty exactly-once concrete.** Dedup check, balance update and processed-`order_id` write in one transaction in the loyalty store; no TTL on `q.loyalty` (or a TTL of hours with a dead-letter alert); bind to a versioned routing key (`order.placed.v1`) from day one; confirm quorum-queue TTL and dead-letter semantics in the validation plan.
